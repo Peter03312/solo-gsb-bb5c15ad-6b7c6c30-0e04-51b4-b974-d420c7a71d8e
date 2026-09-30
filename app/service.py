@@ -12,8 +12,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import errors
-from .models import Batch, BatchReview, IdempotencyKey, Production, ProductionInput
-from .schemas import ProductionIn, RawBatchIn, ReviewIn, SuspectIn
+from .models import (
+    Batch,
+    BatchReview,
+    IdempotencyKey,
+    Production,
+    ProductionCancellation,
+    ProductionInput,
+)
+from .schemas import (
+    ProductionCancellationIn,
+    ProductionIn,
+    RawBatchIn,
+    ReviewIn,
+    SuspectIn,
+)
 
 # ---------------------------------------------------------------- 幂等支持
 
@@ -203,6 +216,13 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
         if batch.is_quarantined:
             raise errors.batch_quarantined(item.batch_no)
 
+    # 已撤销生产单的产出编号永久保留但不得再投料（与 QC 锁串行化，
+    # 撤销事务取 QC 表锁，因此这里读到的“有效/已撤销”状态与最终一致）
+    cancelled_nos = cancelled_output_nos(session, source_nos)
+    for item in data.inputs:
+        if item.batch_no in cancelled_nos:
+            raise errors.batch_cancelled(item.batch_no)
+
     if session.get(Batch, data.output_batch_no) is not None:
         raise errors.batch_exists(data.output_batch_no)
 
@@ -264,12 +284,211 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
     ).scalar_one()
 
 
+def cancelled_output_nos(session: Session, batch_nos: list[str]) -> set[str]:
+    """给定批次编号中，属于“已撤销生产单产出”的子集。"""
+    if not batch_nos:
+        return set()
+    rows = session.execute(
+        select(Production.output_no)
+        .join(ProductionCancellation, ProductionCancellation.production_id == Production.id)
+        .where(Production.output_no.in_(batch_nos))
+    ).all()
+    return {r[0] for r in rows}
+
+
+def _load_production(session: Session, output_no: str) -> Production | None:
+    """按产出编号加载生产单（含投料、来源批次与撤销记录）。"""
+    return session.execute(
+        select(Production)
+        .options(
+            selectinload(Production.inputs).selectinload(ProductionInput.source_batch),
+            selectinload(Production.cancellation),
+        )
+        .where(Production.output_no == output_no)
+    ).scalar_one_or_none()
+
+
+def _require_production(session: Session, output_no: str) -> Production:
+    """产出编号必须存在且确为某生产单的产出，否则按约定拒绝（不改任何状态）。"""
+    if session.get(Batch, output_no) is None:
+        raise errors.batch_not_found(output_no)
+    prod = _load_production(session, output_no)
+    if prod is None:
+        raise errors.production_not_found(output_no)
+    return prod
+
+
+def get_production_detail(session: Session, output_no: str) -> dict[str, Any]:
+    """查询生产单：原单据（投料明细）+ 撤销状态/撤销原因（若已撤销）。"""
+    prod = _require_production(session, output_no)
+    unit = session.get(Batch, output_no).unit
+    return _production_detail_dict(prod, unit)
+
+
+def get_cancellation_detail(session: Session, output_no: str) -> dict[str, Any]:
+    """查询某产出的撤销记录（未撤销 -> CANCELLATION_NOT_FOUND 404）。"""
+    prod = _require_production(session, output_no)
+    if prod.cancellation is None:
+        raise errors.cancellation_not_found(output_no)
+    return _cancellation_result_dict(prod)
+
+
+def _production_detail_dict(prod: Production, unit: str) -> dict[str, Any]:
+    return {
+        "output_batch_no": prod.output_no,
+        "unit": unit,
+        "output_quantity": prod.output_qty,
+        "inputs": [
+            {"batch_no": pi.source_no, "quantity": pi.qty}
+            for pi in sorted(prod.inputs, key=lambda x: x.id)
+        ],
+        "status": "cancelled" if prod.cancellation is not None else "active",
+        "cancellation": (
+            {
+                "cancel_reason": prod.cancellation.cancel_reason,
+                "cancelled_at": prod.cancellation.cancelled_at,
+            }
+            if prod.cancellation is not None
+            else None
+        ),
+    }
+
+
+def _cancellation_result_dict(prod: Production) -> dict[str, Any]:
+    """撤销结果/撤销记录：产出编号、状态、返还明细、撤销原因与时间。
+
+    返还量直接取原生产单投料明细（撤销后这些行不再变化）；remaining_qty 取
+    来源批次的当前余量（撤销事务内即“返还后余量”，历史查询时可能已被后续
+    生产再次消耗，展示的是查询时刻余量）。
+    """
+    assert prod.cancellation is not None
+    returns = []
+    for pi in sorted(prod.inputs, key=lambda x: x.id):
+        source = pi.source_batch
+        # 撤销事务已把原投料量加回；若之后该来源又被其它生产消耗，
+        # 这里展示的是“当前余量”，返还量本身恒为原投料量。
+        remaining = source.remaining_qty
+        returns.append(
+            {
+                "batch_no": pi.source_no,
+                "returned_quantity": pi.qty,
+                "remaining_qty": remaining,
+            }
+        )
+    return {
+        "output_batch_no": prod.output_no,
+        "status": "cancelled",
+        "returns": returns,
+        "cancellation": {
+            "cancel_reason": prod.cancellation.cancel_reason,
+            "cancelled_at": prod.cancellation.cancelled_at,
+        },
+    }
+
+
+def cancel_production(
+    session: Session, output_no: str, data: ProductionCancellationIn
+) -> dict[str, Any]:
+    """撤销一张录入错误的生产单。
+
+    仅当产出满足全部条件时才允许撤销，任一不符整笔拒绝、不改变任何库存：
+    1. 产出编号存在且确为生产单产出；
+    2. 该生产单尚未撤销（重复撤销拒绝）；
+    3. 产出当前非疑似；
+    4. 产出无质检复核记录；
+    5. 产出从未被后续生产投料（仅统计仍有效、未撤销的下游单）。
+
+    通过后在同一事务内：
+    - 向各来源批次返还原投料量（即使来源批次已隔离也照常返还）；
+    - 产出批次余量清零并标记作废（编号保留，不再允许投料）；
+    - 写入撤销记录（原因 + 时间）；
+    - 撤销的投料边即时退出有效谱系与疑似隔离传播，并按有效谱系重算
+      产出自身的隔离标志。
+
+    并发：先取与污染标记/复核相同的 QC 串行化锁（PG 表锁，SQLite 由
+    BEGIN IMMEDIATE 全库串行），再按编号升序锁定产出与各来源批次——
+    与生产投料的排序行锁共用同一全局加锁顺序，杜绝死锁；撤销与投料、
+    污染标记、复核并发时等价于某一串行顺序，不会超用余量或误放行。
+    """
+    _acquire_qc_lock(session)
+
+    # 先在固定点上确认生产单存在，再确定需要锁定的来源集合
+    prod = _load_production(session, output_no)
+    if session.get(Batch, output_no) is None:
+        raise errors.batch_not_found(output_no)
+    if prod is None:
+        raise errors.production_not_found(output_no)
+    if prod.cancellation is not None:
+        raise errors.production_already_cancelled(output_no)
+
+    source_nos = sorted({pi.source_no for pi in prod.inputs})
+    # 产出与来源统一按编号升序加锁，与 submit_production 的加锁顺序一致
+    locked = _lock_batches_in_order(session, [output_no, *source_nos])
+    output = locked[output_no]
+
+    # 条件 3/4：当前疑似、或已有复核记录 -> 拒绝
+    if output.is_suspect:
+        raise errors.output_is_suspect(output_no)
+    reviewed = session.execute(
+        select(BatchReview.id).where(BatchReview.batch_no == output_no).limit(1)
+    ).first()
+    if reviewed is not None:
+        raise errors.output_has_review(output_no)
+
+    # 条件 5：产出已被“仍有效”的后续生产投料 -> 拒绝（下游单自身已撤销的不算）
+    downstream = session.execute(
+        select(ProductionInput.id)
+        .join(Production, Production.id == ProductionInput.production_id)
+        .outerjoin(
+            ProductionCancellation,
+            ProductionCancellation.production_id == Production.id,
+        )
+        .where(ProductionInput.source_no == output_no)
+        .where(ProductionCancellation.id.is_(None))
+        .limit(1)
+    ).first()
+    if downstream is not None:
+        raise errors.output_already_consumed(output_no)
+
+    # 全部条件满足：同事务返还各来源原投料量（来源是否隔离不影响返还）
+    for pi in prod.inputs:
+        source = locked[pi.source_no]
+        source.remaining_qty += pi.qty
+
+    # 产出逻辑作废：编号/原单据保留，余量清零，永不再投料
+    output.remaining_qty = 0
+
+    record = ProductionCancellation(
+        production_id=prod.id, cancel_reason=data.cancel_reason.strip()
+    )
+    session.add(record)
+    # 显式建立关系，避免 selectinload 的身份映射缓存仍把 cancellation 视作 None
+    prod.cancellation = record
+    session.flush()  # 让撤销边对下面的有效谱系谓词立即不可见
+
+    # 撤销边退出传播后，按“自身疑似或任一有效祖先疑似”重算产出隔离标志。
+    # 上面已拒绝“自身疑似”，且其全部祖先边刚被本单撤销，故必为 False；
+    # 仍以统一谓词落库，避免任何标志漂移。
+    should_quarantine = bool(
+        session.execute(text(_ANCESTOR_SUSPECT_SQL), {"root": output_no}).scalar_one()
+    )
+    output.is_quarantined = should_quarantine
+
+    session.flush()
+    return _cancellation_result_dict(prod)
+
+
 # ---------------------------------------------------------------- 谱系与污染
 
-# 边方向：source -> output（原料指向产出）
+# 边方向：source -> output（原料指向产出）。
+# 已撤销生产单的投料边不进入“有效谱系”：以 LEFT JOIN ... IS NULL 排除
+# 存在撤销记录的生产单（撤销是逻辑作废，原行保留可查但不再参与谱系/疑似传播）。
 _EDGE_CTE = """
 SELECT pi.source_no AS parent_no, p.output_no AS child_no
-FROM production_inputs pi JOIN productions p ON p.id = pi.production_id
+FROM production_inputs pi
+JOIN productions p ON p.id = pi.production_id
+LEFT JOIN production_cancellations pc ON pc.production_id = p.id
+WHERE pc.id IS NULL
 """
 
 
@@ -387,9 +606,15 @@ def lineage(session: Session, batch_no: str) -> dict[str, Any]:
     ]
 
     involved = set(up_map) | set(down_map) | {batch_no}
+    # 有效谱系子图仅包含未撤销生产单的投料边
     edges = session.execute(
         select(ProductionInput.source_no, Production.output_no)
         .join(Production, Production.id == ProductionInput.production_id)
+        .outerjoin(
+            ProductionCancellation,
+            ProductionCancellation.production_id == Production.id,
+        )
+        .where(ProductionCancellation.id.is_(None))
         .where(
             ProductionInput.source_no.in_(involved),
             Production.output_no.in_(involved),

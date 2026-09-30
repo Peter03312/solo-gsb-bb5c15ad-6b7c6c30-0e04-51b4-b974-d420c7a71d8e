@@ -14,6 +14,9 @@ from .schemas import (
     BatchOut,
     DescendantsOut,
     LineageOut,
+    ProductionCancellationIn,
+    ProductionCancellationResult,
+    ProductionDetailOut,
     ProductionIn,
     ProductionOut,
     RawBatchIn,
@@ -25,7 +28,7 @@ from .schemas import (
 router = APIRouter()
 
 
-def _batch_out(batch: Batch) -> dict[str, Any]:
+def _batch_out(batch: Batch, cancelled: bool = False) -> dict[str, Any]:
     return {
         "batch_no": batch.batch_no,
         "unit": batch.unit,
@@ -33,6 +36,7 @@ def _batch_out(batch: Batch) -> dict[str, Any]:
         "remaining_qty": float(batch.remaining_qty),
         "is_suspect": batch.is_suspect,
         "is_quarantined": batch.is_quarantined,
+        "is_cancelled": cancelled,
         "note": batch.note,
     }
 
@@ -120,6 +124,61 @@ def create_production(
     return result
 
 
+@router.get("/productions/{output_batch_no}", response_model=ProductionDetailOut)
+def get_production(output_batch_no: str, session: SessionDep) -> dict[str, Any]:
+    """查询生产单：原单据与投料明细，以及撤销状态/撤销原因（若已撤销）。"""
+    return service.get_production_detail(session, output_batch_no)
+
+
+@router.get(
+    "/productions/{output_batch_no}/cancellation",
+    response_model=ProductionCancellationResult,
+)
+def get_production_cancellation(
+    output_batch_no: str, session: SessionDep
+) -> dict[str, Any]:
+    """查询撤销结果：产出编号、返还明细、撤销原因与时间。未撤销报 404。"""
+    return service.get_cancellation_detail(session, output_batch_no)
+
+
+@router.post(
+    "/productions/{output_batch_no}/cancellation",
+    response_model=ProductionCancellationResult,
+    status_code=status.HTTP_200_OK,
+)
+def cancel_production(
+    output_batch_no: str,
+    body: ProductionCancellationIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """撤销录入错误的生产单：返还各来源原投料量、作废产出、保留单据可查。"""
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_200_OK, service.cancel_production(session, output_batch_no, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
 @router.get("/batches/{batch_no}", response_model=BatchOut)
 def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
     batch = session.get(Batch, batch_no)
@@ -127,7 +186,8 @@ def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
         from .errors import batch_not_found
 
         raise batch_not_found(batch_no)
-    return _batch_out(batch)
+    cancelled = batch_no in service.cancelled_output_nos(session, [batch_no])
+    return _batch_out(batch, cancelled)
 
 
 @router.get("/batches/{batch_no}/lineage", response_model=LineageOut)

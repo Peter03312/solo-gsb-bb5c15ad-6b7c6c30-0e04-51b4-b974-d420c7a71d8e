@@ -25,8 +25,11 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="批次追溯服务",
-        description="小型食品加工厂本地批次追溯：登记、投料、余量、谱系、污染隔离",
-        version="1.0.0",
+        description=(
+            "小型食品加工厂本地批次追溯：登记、投料、余量、谱系、污染隔离、"
+            "质检复核与生产单撤销（返还原投料量、作废产出、单据留存）"
+        ),
+        version="1.1.0",
         lifespan=lifespan,
     )
 

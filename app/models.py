@@ -72,6 +72,10 @@ class Production(Base):
         back_populates="production", cascade="all, delete-orphan"
     )
     output: Mapped[Batch] = relationship(foreign_keys=[output_no])
+    # 撤销后保留原生产单与产出编号，仅追加一条撤销记录（一对一）
+    cancellation: Mapped["ProductionCancellation | None"] = relationship(
+        back_populates="production", cascade="all, delete-orphan", uselist=False
+    )
 
     __table_args__ = (
         CheckConstraint("output_qty > 0", name="ck_production_output_positive"),
@@ -102,6 +106,28 @@ class ProductionInput(Base):
         CheckConstraint("qty > 0", name="ck_production_input_qty_positive"),
         Index("ix_prod_input_source", "source_no"),
     )
+
+
+class ProductionCancellation(Base):
+    """生产单撤销记录：每个产出至多一条（与 Production 一对一）。
+
+    撤销是“逻辑作废”：原生产单、投料边、产出批次编号与本撤销记录都保留，
+    供后续查询；但被撤销的投料边不再进入有效谱系/疑似传播，产出批次不再
+    允许投料，各来源批次的原投料量已在同一事务内返还。
+    """
+
+    __tablename__ = "production_cancellations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    production_id: Mapped[int] = mapped_column(
+        ForeignKey("productions.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    cancel_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    cancelled_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    production: Mapped[Production] = relationship(back_populates="cancellation")
 
 
 class BatchReview(Base):

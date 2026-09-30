@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -12,8 +13,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import errors
-from .models import Batch, BatchReview, IdempotencyKey, Production, ProductionInput
-from .schemas import ProductionIn, RawBatchIn, ReviewIn, SuspectIn
+from .models import (
+    Batch,
+    BatchReview,
+    IdempotencyKey,
+    Production,
+    ProductionInput,
+    ProductionRevocation,
+)
+from .schemas import (
+    ProductionIn,
+    RawBatchIn,
+    ReviewIn,
+    RevocationIn,
+    SuspectIn,
+)
 
 # ---------------------------------------------------------------- 幂等支持
 
@@ -154,13 +168,13 @@ def _lock_batches_in_order(
 
 
 def _acquire_qc_lock(session: Session) -> None:
-    """污染标记/复核等 QC 写事务的串行化锁。
+    """QC/谱系结构类写事务（污染标记、复核、生产撤销）的串行化锁。
 
     PostgreSQL：对 batches 取 SHARE ROW EXCLUSIVE 表锁。它与生产事务的
     ROW SHARE（SELECT ... FOR UPDATE）/ ROW EXCLUSIVE（写入）冲突，也与
-    其它 QC 事务互斥——使“标记/复核”与“投料”严格串行，既杜绝隔离批次被
-    投料，也避免“先锁 root、再锁后代”与生产的排序行锁之间形成死锁环。
-    QC 操作低频，粗粒度表锁代价可接受。
+    其它 QC 事务互斥——使“标记/复核/撤销”与“投料”严格串行，既杜绝隔离
+    批次被投料、已撤销产出被并发投料，也避免“先锁 root、再锁后代/来源”
+    与生产的排序行锁之间形成死锁环。这类操作低频，粗粒度表锁代价可接受。
     SQLite：BEGIN IMMEDIATE 已提供全库写串行化，无需额外处理。
     """
     if session.get_bind().dialect.name == "postgresql":
@@ -172,7 +186,7 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
 
     校验顺序（任一失败整笔拒绝、不改变余量）：
     1. 投入明细编号不重复；
-    2. 每个来源批次存在、单位一致、未隔离；
+    2. 每个来源批次存在、单位一致、未隔离、不是已撤销生产单的产出；
     3. 产出编号未被占用；
     4. 每笔用量为正且不超过该批次余量；
     5. 产出总量不超过投入总量。
@@ -200,6 +214,9 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
         batch = sources[item.batch_no]
         if batch.unit != data.unit:
             raise errors.unit_mismatch(item.batch_no, batch.unit, data.unit)
+        # 已撤销生产单的产出（其投料边已退出有效谱系）不得再投料
+        if batch.output_production is not None and batch.output_production.revocation is not None:
+            raise errors.batch_revoked(item.batch_no)
         if batch.is_quarantined:
             raise errors.batch_quarantined(item.batch_no)
 
@@ -266,10 +283,16 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
 
 # ---------------------------------------------------------------- 谱系与污染
 
-# 边方向：source -> output（原料指向产出）
+# 边方向：source -> output（原料指向产出）。
+# 已撤销生产单的投料边不再进入有效谱系查询与疑似隔离传播：
+# 用 NOT EXISTS 排除在 production_revocations 中有撤销记录的生产单。
 _EDGE_CTE = """
 SELECT pi.source_no AS parent_no, p.output_no AS child_no
-FROM production_inputs pi JOIN productions p ON p.id = pi.production_id
+FROM production_inputs pi
+JOIN productions p ON p.id = pi.production_id
+WHERE NOT EXISTS (
+    SELECT 1 FROM production_revocations pr WHERE pr.production_id = p.id
+)
 """
 
 
@@ -387,12 +410,15 @@ def lineage(session: Session, batch_no: str) -> dict[str, Any]:
     ]
 
     involved = set(up_map) | set(down_map) | {batch_no}
+    # 已撤销生产单的投料边不进入有效谱系：外连接撤销记录并排除其存在的边
     edges = session.execute(
         select(ProductionInput.source_no, Production.output_no)
         .join(Production, Production.id == ProductionInput.production_id)
+        .outerjoin(ProductionRevocation, ProductionRevocation.production_id == Production.id)
         .where(
             ProductionInput.source_no.in_(involved),
             Production.output_no.in_(involved),
+            ProductionRevocation.id.is_(None),
         )
     ).all()
     return {
@@ -502,4 +528,146 @@ def review_suspect(session: Session, data: ReviewIn) -> dict[str, Any]:
         "affected_batch_nos": descendant_nos,
         "released_batch_nos": released,
         "still_quarantined": still,
+    }
+
+
+# ---------------------------------------------------------------- 生产单撤销
+
+
+def _utc_iso(dt: datetime) -> str:
+    """统一时间戳序列化：SQLite 读回 naive 时间时按 UTC 处理，
+    使“撤销响应中的 revoked_at”与“之后查询读回的 revoked_at”逐字一致。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+# 该产出是否已被“有效（未撤销）”后续生产投料：撤销单的投料边不计在内。
+_ACTIVE_CONSUMED_SQL = f"""
+SELECT EXISTS(
+    SELECT 1
+    FROM production_inputs pi
+    JOIN productions p ON p.id = pi.production_id
+    WHERE pi.source_no = :output_no
+      AND NOT EXISTS (
+          SELECT 1 FROM production_revocations pr WHERE pr.production_id = p.id
+      )
+)
+"""
+
+
+def revoke_production(session: Session, data: RevocationIn) -> dict[str, Any]:
+    """撤销一次生产单（录入错误更正），同一事务内返还各来源原投料量。
+
+    仅允许撤销满足全部条件的产出：
+    - 产出编号存在且确为某生产单的产出（否则 PRODUCTION_NOT_FOUND 404）；
+    - 该生产单尚未撤销（否则 PRODUCTION_ALREADY_REVOKED 409）；
+    - 产出批次当前非疑似（否则 OUTPUT_IS_SUSPECT 409）；
+    - 该产出无质检复核记录（否则 OUTPUT_HAS_REVIEW 409）；
+    - 从未被后续有效生产投料（否则 OUTPUT_ALREADY_CONSUMED 409）。
+
+    任一条件不符：整笔拒绝、不改变任何余量。
+    通过后在同一事务内：
+    - 各来源批次按原投料量返还 remaining_qty（来源即便已隔离也照样返还）；
+    - 产出批次余量清零（已撤销产出不得投料）；
+    - 写入撤销记录（非空原因），原生产单与投料明细保留供查询；
+    - 该单投料边经谱系 CTE 的撤销过滤退出有效谱系与疑似隔离传播。
+
+    并发：先取 QC/谱系结构串行化锁（PG 表锁 / SQLite 全库写锁），
+    再按编号升序锁定来源批次，与投料、污染标记、复核并发的结果等价于
+    某一串行顺序——既不会超用余量，也不会把已撤销/隔离批次误投料或误放行。
+    """
+    _acquire_qc_lock(session)
+
+    output_no = data.output_batch_no
+    # 锁定产出批次行（PG FOR UPDATE；SQLite 由 BEGIN IMMEDIATE 覆盖）
+    output = _lock_batch(session, output_no)
+    if output is None:
+        raise errors.production_not_found(output_no)
+
+    prod = session.execute(
+        select(Production)
+        .options(selectinload(Production.inputs), selectinload(Production.revocation))
+        .where(Production.output_no == output_no)
+    ).scalar_one_or_none()
+    if prod is None:
+        # 编号存在但不是任何生产单的产出（如原料批次），同样无单可撤
+        raise errors.production_not_found(output_no)
+
+    if prod.revocation is not None:
+        raise errors.production_already_revoked(output_no)
+    if output.is_suspect:
+        raise errors.output_is_suspect(output_no)
+
+    review = session.execute(
+        select(BatchReview.id).where(BatchReview.batch_no == output_no)
+    ).first()
+    if review is not None:
+        raise errors.output_has_review(output_no)
+
+    consumed = session.execute(
+        text(_ACTIVE_CONSUMED_SQL), {"output_no": output_no}
+    ).scalar_one()
+    if consumed:
+        raise errors.output_already_consumed(output_no)
+
+    # 按编号升序锁定全部来源后返还（与生产提交同一全局加锁顺序，杜绝死锁）
+    source_nos = sorted(pi.source_no for pi in prod.inputs)
+    sources = _lock_batches_in_order(session, source_nos)
+
+    returns: list[dict[str, Any]] = []
+    for pi in sorted(prod.inputs, key=lambda x: x.id):
+        source = sources.get(pi.source_no)
+        if source is None:  # 理论不可达：来源行随生产单外键必然存在
+            raise errors.batch_not_found(pi.source_no)
+        source.remaining_qty += pi.qty
+        returns.append({"batch_no": source.batch_no, "quantity": pi.qty})
+
+    # 产出余量清零：撤销单的产出不得再投料（BATCH_REVOKED 兜底拦截）
+    output.remaining_qty = Decimal("0")
+
+    revoked_at = datetime.now(timezone.utc)
+    session.add(
+        ProductionRevocation(
+            production_id=prod.id,
+            revoke_reason=data.revoke_reason,
+            revoked_at=revoked_at,
+        )
+    )
+    session.flush()
+
+    return {
+        "output_batch_no": output_no,
+        "status": "REVOKED",
+        "revoke_reason": data.revoke_reason,
+        "revoked_at": _utc_iso(revoked_at),
+        "returns": returns,
+        "output_quantity": prod.output_qty,
+        "unit": output.unit,
+    }
+
+
+def get_production_detail(session: Session, output_no: str) -> dict[str, Any]:
+    """按产出批次编号查询生产单：原单据内容 + 撤销状态/原因（留痕供查询）。"""
+    prod = session.execute(
+        select(Production)
+        .options(selectinload(Production.inputs), selectinload(Production.revocation))
+        .where(Production.output_no == output_no)
+    ).scalar_one_or_none()
+    if prod is None:
+        raise errors.production_not_found(output_no)
+
+    output = session.get(Batch, output_no)
+    revoked = prod.revocation
+    return {
+        "output_batch_no": prod.output_no,
+        "unit": output.unit if output is not None else None,
+        "output_quantity": prod.output_qty,
+        "inputs": [
+            {"batch_no": pi.source_no, "qty": pi.qty}
+            for pi in sorted(prod.inputs, key=lambda x: x.id)
+        ],
+        "status": "REVOKED" if revoked is not None else "ACTIVE",
+        "revoke_reason": revoked.revoke_reason if revoked is not None else None,
+        "revoked_at": _utc_iso(revoked.revoked_at) if revoked is not None else None,
     }

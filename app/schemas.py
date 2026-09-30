@@ -67,6 +67,22 @@ class ReviewIn(BaseModel):
         return value
 
 
+class RevocationIn(BaseModel):
+    """撤销生产单：产出批次编号 + 非空白撤销原因。"""
+
+    output_batch_no: BatchNo
+    revoke_reason: str = Field(
+        min_length=1, max_length=1000, examples=["录单错误：投料量多录 10kg，撤销后重新开单"]
+    )
+
+    @field_validator("revoke_reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("撤销原因不得为空白")
+        return value
+
+
 # ---------- 响应 ----------
 
 
@@ -82,6 +98,8 @@ class BatchOut(_ORMModel):
     is_suspect: bool
     is_quarantined: bool
     note: str | None = None
+    # 新增（默认 False，旧调用方无需改动）：该批次是否为已撤销生产单的产出
+    is_revoked: bool = False
 
 
 class ConsumptionOut(_ORMModel):
@@ -126,3 +144,23 @@ class ReviewOut(BaseModel):
     affected_batch_nos: list[str]
     released_batch_nos: list[str]
     still_quarantined: list[str]
+
+
+class RevocationOut(BaseModel):
+    """撤销结果：产出编号、返还明细、撤销状态（含原单据与原因留痕）。"""
+
+    output_batch_no: str
+    status: str
+    revoke_reason: str
+    revoked_at: str
+    returns: list[ConsumptionOut]
+    output_quantity: float
+    unit: str
+
+
+class ProductionDetailOut(ProductionOut):
+    """生产单查询：原单据内容 + 当前是否已撤销及撤销信息。"""
+
+    status: str
+    revoke_reason: str | None = None
+    revoked_at: str | None = None

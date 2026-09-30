@@ -79,9 +79,11 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | POST | `/raw-batches` | 登记一个原料批次及初始数量 |
 | POST | `/productions` | 提交一次生产：多批次投入 → 一个产出批次 |
 | GET | `/batches/{batch_no}` | 查询批次余量与状态 |
-| GET | `/batches/{batch_no}/lineage` | 查询上下游谱系（递归） |
+| GET | `/batches/{batch_no}/lineage` | 查询上下游谱系（递归，不含已撤销投料边） |
 | POST | `/contamination` | 标记疑似污染批次，返回并隔离全部后代 |
 | POST | `/reviews` | 质检复核确认误报：撤销疑似标记并重算隔离 |
+| POST | `/productions/{output_batch_no}/revoke` | 凭产出批次编号 + 非空撤销原因撤销生产单 |
+| GET | `/productions/{output_batch_no}` | 按产出编号查询生产单（原单据 + 撤销状态/原因） |
 
 ### 业务规则
 
@@ -103,6 +105,28 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
    按编号排序加锁避免死锁；SQLite 以 `BEGIN IMMEDIATE` 串行化写事务），并发提交**不会超用**同一批次余量。
    污染标记/复核对“自身 + 全部后代”的闭包按编号排序加行锁，与生产事务互斥，
    并发结果等价于复核、污染标记、投料三者的某一串行顺序；隔离批次绝不会被投料。
+9. 生产单撤销（录入错误更正）：操作员凭**产出批次编号**与**非空白撤销原因**调用
+   `POST /productions/{output_batch_no}/revoke`。仅允许撤销同时满足以下条件的产出，
+   任一不符整笔拒绝、**不改变任何库存**：
+   - 产出编号存在且确为某生产单的产出（否则 `PRODUCTION_NOT_FOUND` 404）；
+   - 该生产单**尚未撤销**（重复撤销报 `PRODUCTION_ALREADY_REVOKED` 409）；
+   - 产出批次**当前非疑似**（`OUTPUT_IS_SUSPECT` 409）；
+   - 产出**无复核记录**（`OUTPUT_HAS_REVIEW` 409）；
+   - **从未被后续有效生产投料**（被投料报 `OUTPUT_ALREADY_CONSUMED` 409；
+     投料它的后续单若也已撤销，则该投料边已失效，不构成阻碍）。
+
+   撤销在**同一事务**内把各来源的**原投料量逐笔返还**（来源批次即使已隔离也照样返还；
+   隔离只限制再投料，不限制返还），产出批次余量清零并标记为已撤销。
+   撤销是**软删除**：产出编号、原生产单（含投料明细）与撤销原因永久保留，
+   可经 `GET /productions/{output_batch_no}` 与批次查询检索；编号**不得复用**。
+   撤销后：已撤销产出**不得再投料**（`BATCH_REVOKED` 409）；该单投料边**不再进入
+   有效谱系查询，也不再参与疑似隔离传播**（撤销前已被传播打上的隔离标志不影响该规则；
+   撤销不会改变任何批次的疑似/隔离状态，因而不会误放行仍疑似的来源）。
+   撤销事务与投料、污染标记、复核共用同一套串行化锁，并发结果等价于某一串行顺序，
+   不会超用余量或误放行。撤销写请求同样要求 `Idempotency-Key`，沿用同体重放、
+   异体 `409 IDEMPOTENCY_CONFLICT` 约定。`GET /batches/{batch_no}` 响应新增布尔字段
+   `is_revoked`（默认 `false`，旧调用方无需改动）；其余既有接口字段与未撤销数据的
+   行为完全保持兼容。
 
 ### 错误响应格式
 
@@ -110,9 +134,12 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 { "error": { "code": "INSUFFICIENT_BALANCE", "message": "批次 'RM-1' 余量不足：请求 200，剩余 100", "details": { } } }
 ```
 
-常见错误码：`SOURCE_NOT_FOUND`(404)、`BATCH_NO_REUSED`(409)、`INSUFFICIENT_BALANCE`(409)、
-`UNIT_MISMATCH`(422)、`OUTPUT_EXCEEDS_INPUT`(422)、`VALIDATION_ERROR`(422)、
-`BATCH_QUARANTINED`(409)、`BATCH_NOT_SUSPECT`(409)、`IDEMPOTENCY_CONFLICT`(409)。
+常见错误码：`SOURCE_NOT_FOUND`(404)、`PRODUCTION_NOT_FOUND`(404)、`BATCH_NO_REUSED`(409)、
+`INSUFFICIENT_BALANCE`(409)、`UNIT_MISMATCH`(422)、`OUTPUT_EXCEEDS_INPUT`(422)、
+`VALIDATION_ERROR`(422)、`BATCH_QUARANTINED`(409)、`BATCH_NOT_SUSPECT`(409)、
+`IDEMPOTENCY_CONFLICT`(409)，以及撤销相关的 `BATCH_REVOKED`(409)、
+`PRODUCTION_ALREADY_REVOKED`(409)、`OUTPUT_IS_SUSPECT`(409)、
+`OUTPUT_HAS_REVIEW`(409)、`OUTPUT_ALREADY_CONSUMED`(409)。
 
 ---
 
@@ -288,6 +315,96 @@ curl -i -X POST http://localhost:8080/productions \
 # HTTP/1.1 409 ... INSUFFICIENT_BALANCE；MIX-X 未创建，RM-A 余量仍为 60
 ```
 
+### 9. 撤销录入错误的生产单
+
+沿用第 2 节的混料生产（`RM-A 40 + RM-B 55 -> MIX-1 90`，投料后 RM-A 余 60、RM-B 余 25）。
+发现录单错误后，凭**产出批次编号**与**非空撤销原因**撤销：
+
+```bash
+curl -X POST http://localhost:8080/productions/MIX-1/revoke \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: revoke-mix1-001' \
+  -d '{"output_batch_no":"MIX-1","revoke_reason":"投料量多录 10kg，撤销后重新开单"}'
+```
+
+```json
+{
+  "output_batch_no": "MIX-1",
+  "status": "REVOKED",
+  "revoke_reason": "投料量多录 10kg，撤销后重新开单",
+  "revoked_at": "2026-09-30T03:12:44.812033+00:00",
+  "returns": [
+    {"batch_no": "RM-A", "quantity": 40.0},
+    {"batch_no": "RM-B", "quantity": 55.0}
+  ],
+  "output_quantity": 90.0,
+  "unit": "kg"
+}
+```
+
+- `returns` 为各来源的**原投料量返还明细**：RM-A 余量回到 100、RM-B 回到 80；
+  **即使来源批次当时已隔离，也在同一事务内照额返还**（隔离只禁止再投料）。
+- 产出 `MIX-1` 余量清零并标记 `is_revoked=true`；编号保留、不得复用。
+
+```bash
+curl http://localhost:8080/batches/MIX-1
+# {"batch_no":"MIX-1","unit":"kg","initial_qty":90.0,"remaining_qty":0.0,
+#  "is_suspect":false,"is_quarantined":false,"note":null,"is_revoked":true}
+```
+
+原生产单与撤销原因留痕，可随时按产出编号查询：
+
+```bash
+curl http://localhost:8080/productions/MIX-1
+```
+
+```json
+{
+  "output_batch_no": "MIX-1", "unit": "kg", "output_quantity": 90.0,
+  "inputs": [
+    {"batch_no": "RM-A", "quantity": 40.0},
+    {"batch_no": "RM-B", "quantity": 55.0}
+  ],
+  "status": "REVOKED",
+  "revoke_reason": "投料量多录 10kg，撤销后重新开单",
+  "revoked_at": "2026-09-30T03:12:44.812033+00:00"
+}
+```
+
+撤销后的约束：
+
+```bash
+# 1) 已撤销产出不得投料
+curl -i -X POST http://localhost:8080/productions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: prod-fg2-002' \
+  -d '{"output_batch_no":"FG-2","unit":"kg","output_quantity":5,
+       "inputs":[{"batch_no":"MIX-1","quantity":5}]}'
+# 409 BATCH_REVOKED
+
+# 2) 撤销边退出有效谱系：RM-A 的下游不再含 MIX-1
+curl http://localhost:8080/batches/RM-A/lineage
+# {"batch_no":"RM-A","upstream":[],"downstream":[],"edges":[]}
+
+# 3) 撤销边不再传播污染：标记 RM-A 时 MIX-1 不受影响
+# （affected_batch_nos 不含 MIX-1，MIX-1 的 is_quarantined 仍为 false）
+
+# 4) 重复撤销明确拒绝，且不二次返还
+curl -i -X POST http://localhost:8080/productions/MIX-1/revoke \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: revoke-mix1-002' \
+  -d '{"output_batch_no":"MIX-1","revoke_reason":"再撤一次"}'
+# 409 PRODUCTION_ALREADY_REVOKED；RM-A/RM-B 余量不变
+
+# 5) 其它条件不符同样整笔拒绝、不改库存：
+#    编号不存在/编号非产出 -> 404 PRODUCTION_NOT_FOUND
+#    当前疑似             -> 409 OUTPUT_IS_SUSPECT
+#    有复核记录           -> 409 OUTPUT_HAS_REVIEW
+#    已被后续生产投料     -> 409 OUTPUT_ALREADY_CONSUMED
+#    撤销原因为空白       -> 422 VALIDATION_ERROR；缺少 Idempotency-Key -> 400
+```
+
+安全重试与其它写接口完全一致：同一 `Idempotency-Key` + 同一请求体重试返回首次结果、
+只返还一次；同键异体返回 `409 IDEMPOTENCY_CONFLICT`。
+
 ---
 
 ## 五、项目结构
@@ -296,14 +413,15 @@ curl -i -X POST http://localhost:8080/productions \
 app/
   config.py       # 环境变量配置
   db.py           # 引擎/会话、SQLite 写锁与 PG 行锁支撑、建表
-  models.py       # batches / productions / production_inputs / batch_reviews / idempotency_keys
+  models.py       # batches / productions / production_inputs / batch_reviews /
+                  # production_revocations / idempotency_keys
   schemas.py      # Pydantic 请求响应模型（正数、定点数校验）
   errors.py       # 业务错误码
-  service.py      # 核心逻辑：登记、生产事务、幂等、递归谱系、污染传播、复核重算
+  service.py      # 核心逻辑：登记、生产事务、撤销事务、幂等、递归谱系、污染传播、复核重算
   routes.py       # HTTP 路由
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（33 个用例）
+tests/            # 端到端 + 并发测试（58 个用例）
 Dockerfile
 docker-compose.yml
 ```
@@ -315,17 +433,22 @@ docker-compose.yml
   余量与产出总量，全部通过后才扣减并写入产出；任一校验失败立即回滚。
 - PostgreSQL 依赖 `SELECT ... FOR UPDATE` 行锁串行化同一批次的扣减；
   SQLite 写事务以 `BEGIN IMMEDIATE` 开始并设置 `busy_timeout`，写操作全局串行。
-- 污染标记与复核是低频 QC 操作：事务一开始先取 QC 串行化锁
+- 污染标记、复核与生产撤销是低频 QC/单据维护操作：事务一开始先取同一把串行化锁
   （PostgreSQL 为 `LOCK TABLE batches IN SHARE ROW EXCLUSIVE`，与生产事务的
-  行锁/写入互斥；SQLite 由 `BEGIN IMMEDIATE` 全库写锁覆盖），随后读取
-  “自身 + 全部后代”闭包并写入 `is_suspect` / `is_quarantined`。因此
-  - 复核 / 污染标记 / 投料任意并发，结果都等价于三者的某一串行顺序；
-  - 隔离批次不可能被投料（拿不到与 QC 事务的串行化位置，校验到的
-    隔离标志与最终谱系一致）；
+  行锁/写入互斥；SQLite 由 `BEGIN IMMEDIATE` 全库写锁覆盖），随后读取/写入闭包或
+  返还余量。因此
+  - 复核 / 污染标记 / 投料 / 撤销任意并发，结果都等价于某一串行顺序；
+  - 隔离批次不可能被投料，已撤销产出也不可能被并发投料（拿不到与
+    QC/撤销事务的串行化位置，校验到的标志与最终谱系一致）；
+  - 撤销在表锁内再按编号升序锁定各来源并返还，与生产提交同一全局加锁顺序，
+    返还与扣减互不覆盖、绝不超用；撤销不会修改任何批次的疑似/隔离标志，故不会误放行；
   - 复核重算隔离状态时以“自身疑似或任一祖先疑似”为谓词，混料后代只要还有
     一个疑似来源就继续隔离。
+- 谱系/隔离的递归边统一经“有效边”视图：存在撤销记录的生产单其投料边被
+  `NOT EXISTS production_revocations` 过滤，撤销边既不进入谱系查询，也不传播隔离。
 - 幂等记录与业务数据在同一事务内落库，唯一约束 `(method, path, key)` 兜底并发首请求竞争。
 
-> 注：新表 `batch_reviews` 随启动/入口的 `CREATE TABLE IF NOT EXISTS` 自动创建，
-> 既有数据库升级无需手工迁移；现有登记、生产、污染标记、批次/谱系查询接口的
-> 请求、响应与启动方式均保持不变。
+> 注：新表 `batch_reviews`、`production_revocations` 随启动/入口的
+> `CREATE TABLE IF NOT EXISTS` 自动创建，既有数据库升级无需手工迁移；现有登记、
+> 生产、污染标记、复核、批次/谱系查询接口的请求、响应与启动方式均保持不变
+> （批次查询仅新增默认 `false` 的 `is_revoked` 字段）。

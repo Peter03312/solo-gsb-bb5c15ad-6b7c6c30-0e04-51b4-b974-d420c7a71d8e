@@ -1,4 +1,4 @@
-"""ORM 模型：批次、生产单、投料明细、幂等记录。"""
+"""ORM 模型：批次、生产单、投料明细、质检复核、生产撤销、幂等记录。"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -46,6 +46,10 @@ class Batch(Base):
     inputs: Mapped[list["ProductionInput"]] = relationship(
         back_populates="source_batch", foreign_keys="ProductionInput.source_no"
     )
+    # 若该批次是某次生产的产出，反向指向其生产单（撤销状态经此判定）
+    output_production: Mapped["Production | None"] = relationship(
+        foreign_keys="Production.output_no", back_populates="output", uselist=False
+    )
 
     __table_args__ = (
         CheckConstraint("initial_qty > 0", name="ck_batch_initial_qty_positive"),
@@ -71,7 +75,13 @@ class Production(Base):
     inputs: Mapped[list["ProductionInput"]] = relationship(
         back_populates="production", cascade="all, delete-orphan"
     )
-    output: Mapped[Batch] = relationship(foreign_keys=[output_no])
+    output: Mapped[Batch] = relationship(
+        foreign_keys=[output_no], back_populates="output_production"
+    )
+    # 撤销记录存在即表示该生产单已撤销（软删除：原单据保留供查询）
+    revocation: Mapped["ProductionRevocation | None"] = relationship(
+        back_populates="production", cascade="all, delete-orphan", uselist=False
+    )
 
     __table_args__ = (
         CheckConstraint("output_qty > 0", name="ck_production_output_positive"),
@@ -123,6 +133,29 @@ class BatchReview(Base):
     )
 
     batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
+
+
+class ProductionRevocation(Base):
+    """生产单撤销记录：操作员凭产出批次编号 + 非空撤销原因撤销一次生产。
+
+    每个生产单至多一条撤销记录（一对一，存在即表示已撤销）。
+    撤销是软删除：产出批次与原生产单（含投料明细）均保留供查询，
+    仅在撤销事务内返还各来源原投料量、清零产出余量，并令该单的
+    投料边退出有效谱系/隔离传播。
+    """
+
+    __tablename__ = "production_revocations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    production_id: Mapped[int] = mapped_column(
+        ForeignKey("productions.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    revoke_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    revoked_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    production: Mapped[Production] = relationship(back_populates="revocation")
 
 
 class IdempotencyKey(Base):

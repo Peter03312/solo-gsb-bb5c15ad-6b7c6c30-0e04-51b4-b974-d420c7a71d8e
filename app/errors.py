@@ -59,3 +59,58 @@ def unit_mismatch(batch_no: str, expected: str, actual: str) -> AppError:
         f"批次 {batch_no!r} 单位为 {expected!r}，与申报单位 {actual!r} 不一致",
         422,
     )
+
+
+def production_not_found(output_no: str) -> AppError:
+    """产出编号不存在，或该批次不是任何生产单的产出。"""
+    return AppError(
+        "PRODUCTION_NOT_FOUND",
+        f"不存在产出批次编号为 {output_no!r} 的生产单",
+        404,
+        details={"output_batch_no": output_no},
+    )
+
+
+def production_already_revoked(output_no: str) -> AppError:
+    return AppError(
+        "PRODUCTION_ALREADY_REVOKED",
+        f"产出批次 {output_no!r} 的生产单已撤销，不得重复撤销",
+        409,
+        details={"output_batch_no": output_no},
+    )
+
+
+def output_is_suspect(output_no: str) -> AppError:
+    return AppError(
+        "OUTPUT_IS_SUSPECT",
+        f"产出批次 {output_no!r} 当前为疑似污染批次，不得撤销生产单",
+        409,
+        details={"output_batch_no": output_no},
+    )
+
+
+def output_has_review(output_no: str) -> AppError:
+    return AppError(
+        "OUTPUT_HAS_REVIEW",
+        f"产出批次 {output_no!r} 存在质检复核记录，不得撤销生产单",
+        409,
+        details={"output_batch_no": output_no},
+    )
+
+
+def output_already_consumed(output_no: str) -> AppError:
+    return AppError(
+        "OUTPUT_ALREADY_CONSUMED",
+        f"产出批次 {output_no!r} 已被后续生产投料，不得撤销原生产单",
+        409,
+        details={"output_batch_no": output_no},
+    )
+
+
+def batch_revoked(batch_no: str) -> AppError:
+    return AppError(
+        "BATCH_REVOKED",
+        f"批次 {batch_no!r} 是已撤销生产单的产出，不得再投料",
+        409,
+        details={"batch_no": batch_no},
+    )
